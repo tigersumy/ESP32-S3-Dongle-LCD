@@ -1,0 +1,98 @@
+#pragma once
+
+#include <Arduino.h>
+#include <Preferences.h>
+
+#include <esp_mac.h>
+
+#define BMS_TYPE_AUTO 0
+#define BMS_TYPE_JK   1
+#define BMS_TYPE_JBD  2
+#define BMS_TYPE_DALY 3
+
+struct AppConfig {
+    String  wifi_ssid;
+    String  wifi_pass;
+    String  bms_mac;
+    String  bms_name;
+    uint8_t bms_type;    // 0=Auto, 1=JK, 2=JBD, 3=Daly
+    String  bms_pin;     // Default "123456"
+    uint8_t cell_count;  // 4, 8, 16, 24
+    bool    ts_enabled;  // Tailscale VPN enabled
+    String  ts_hostname; // e.g. "jbd-bms-probe-c9b4"
+    String  ts_auth_key; // Tailscale Auth Key
+};
+
+class ConfigManager {
+public:
+    static String getDefaultHostname() {
+        uint8_t mac[6];
+        if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "jbd-bms-probe-%02x%02x", mac[4], mac[5]);
+            return String(buf);
+        }
+        return "jbd-bms-probe";
+    }
+
+    static AppConfig load() {
+        Preferences prefs;
+        prefs.begin("bms_probe", true);
+
+        AppConfig cfg;
+        cfg.wifi_ssid   = prefs.getString("ssid", "");
+        cfg.wifi_pass   = prefs.getString("pass", "");
+        cfg.bms_mac     = prefs.getString("mac", "");
+        cfg.bms_name    = prefs.getString("name", "BMS Device");
+        cfg.bms_type    = prefs.getUChar("bms_type", BMS_TYPE_AUTO);
+        cfg.bms_pin     = prefs.getString("pin", "123456");
+        cfg.cell_count  = prefs.getUChar("cells", 4);
+        cfg.ts_enabled  = prefs.getBool("ts_en", true);
+        cfg.ts_hostname = prefs.getString("ts_host", "");
+        cfg.ts_auth_key = prefs.getString("ts_key", "");
+
+        if (cfg.ts_hostname.length() == 0 || cfg.ts_hostname == "jbd-bms-probe") {
+            cfg.ts_hostname = getDefaultHostname();
+        }
+        if (cfg.cell_count != 4 && cfg.cell_count != 8 && cfg.cell_count != 16 && cfg.cell_count != 24) {
+            cfg.cell_count = 4;
+        }
+
+        prefs.end();
+        return cfg;
+    }
+
+    static void save(const AppConfig& cfg) {
+        Preferences prefs;
+        prefs.begin("bms_probe", false);
+
+        prefs.putString("ssid", cfg.wifi_ssid);
+        prefs.putString("pass", cfg.wifi_pass);
+        prefs.putString("mac", cfg.bms_mac);
+        prefs.putString("name", cfg.bms_name);
+        prefs.putUChar("bms_type", cfg.bms_type);
+        prefs.putString("pin", cfg.bms_pin);
+        prefs.putUChar("cells", cfg.cell_count);
+        prefs.putBool("ts_en", cfg.ts_enabled);
+        prefs.putString("ts_host", cfg.ts_hostname);
+        if (cfg.ts_auth_key.length() > 0) {
+            prefs.putString("ts_key", cfg.ts_auth_key);
+        }
+
+        prefs.end();
+    }
+
+    static void clear(bool keepTsKey = true) {
+        Preferences prefs;
+        prefs.begin("bms_probe", false);
+        String savedTsKey = "";
+        if (keepTsKey) {
+            savedTsKey = prefs.getString("ts_key", "");
+        }
+        prefs.clear();
+        if (keepTsKey && savedTsKey.length() > 0) {
+            prefs.putString("ts_key", savedTsKey);
+        }
+        prefs.end();
+    }
+};

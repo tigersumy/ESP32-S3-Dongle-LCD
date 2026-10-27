@@ -1,0 +1,1446 @@
+#include "BmsBleClient.h"
+#include <ArduinoJson.h>
+
+static const char* TAG = "BLE";
+static BmsBleClient* s_pInstance = nullptr;
+
+class BmsClientCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pClient) override {
+        DebugLogger::info(TAG, "Connected to BLE peripheral successfully");
+    }
+
+    void onDisconnect(NimBLEClient* pClient, int reason) override {
+        char buf[64];
+        sprintf(buf, "Disconnected from peripheral (reason: %d)", reason);
+        DebugLogger::warn(TAG, buf);
+        if (s_pInstance) {
+            s_pInstance->disconnect();
+        }
+    }
+
+    void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
+        uint32_t pin = 123456;
+        if (s_pInstance && s_pInstance->getConfig().bms_pin.length() > 0) {
+            pin = s_pInstance->getConfig().bms_pin.toInt();
+        }
+        DebugLogger::info("SEC", "BLE Passkey requested -> injecting PIN: " + String(pin));
+        NimBLEDevice::injectPassKey(connInfo, pin);
+    }
+
+    uint32_t onPassKeyDisplay(NimBLEConnInfo& connInfo) override {
+        uint32_t pin = 123456;
+        if (s_pInstance && s_pInstance->getConfig().bms_pin.length() > 0) {
+            pin = s_pInstance->getConfig().bms_pin.toInt();
+        }
+        DebugLogger::info("SEC", "BLE Passkey display -> returning PIN: " + String(pin));
+        return pin;
+    }
+
+    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+        if (connInfo.isEncrypted()) {
+            DebugLogger::info("SEC", "BLE Pairing / Authentication SUCCESSFUL (Encrypted link established)");
+        } else {
+            DebugLogger::warn("SEC", "BLE Pairing finished (Unencrypted link)");
+        }
+    }
+
+    void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pin) override {
+        DebugLogger::info("SEC", "BLE Confirm Passkey PIN: " + String(pin));
+        NimBLEDevice::injectConfirmPasskey(connInfo, true);
+    }
+};
+
+class BmsScanCallbacks : public NimBLEScanCallbacks {
+    void processDevice(const NimBLEAdvertisedDevice* advertisedDevice) {
+        if (!s_pInstance) return;
+
+        String name = advertisedDevice->getName().c_str();
+        String addr = advertisedDevice->getAddress().toString().c_str();
+        int rssi = advertisedDevice->getRSSI();
+        String type = "Unknown";
+
+        if (name.startsWith("DL-") || name.startsWith("DL_") || name.startsWith("Daly") || name.startsWith("DALY") || name.startsWith("DL") || name.startsWith("BMS-") ||
+            advertisedDevice->isAdvertisingService(NimBLEUUID("02f00000-0000-0000-0000-00000000fe00")) ||
+            advertisedDevice->isAdvertisingService(NimBLEUUID("fe00")) || advertisedDevice->isAdvertisingService(NimBLEUUID("FE00"))) {
+            type = "Daly-BMS";
+        } else if (name.startsWith("JK") || advertisedDevice->isAdvertisingService(NimBLEUUID("ffe0")) || advertisedDevice->isAdvertisingService(NimBLEUUID("FFE0"))) {
+            if (name.indexOf("Daly") >= 0 || name.indexOf("DALY") >= 0 || name.startsWith("DL")) {
+                type = "Daly-BMS";
+            } else {
+                type = "JK-BMS";
+            }
+        } else if (name.startsWith("JBD") || name.startsWith("Xiaoxiang") || name.startsWith("SP") || name.startsWith("BS-") || name.startsWith("Smart") ||
+                   advertisedDevice->isAdvertisingService(NimBLEUUID("ff00")) || advertisedDevice->isAdvertisingService(NimBLEUUID("FF00")) ||
+                   advertisedDevice->isAdvertisingService(NimBLEUUID("fee7")) || advertisedDevice->isAdvertisingService(NimBLEUUID("FEE7")) ||
+                   advertisedDevice->isAdvertisingService(NimBLEUUID("0000FF00-0000-1000-8000-00805F9B34FB"))) {
+            type = "JBD-BMS";
+        } else if (advertisedDevice->isAdvertisingService(NimBLEUUID("fff0")) || advertisedDevice->isAdvertisingService(NimBLEUUID("FFF0")) ||
+                   advertisedDevice->isAdvertisingService(NimBLEUUID("0000FFF0-0000-1000-8000-00805F9B34FB"))) {
+            if (name.startsWith("DL") || name.indexOf("Daly") >= 0 || name.indexOf("DALY") >= 0 || name.startsWith("BMS-")) {
+                type = "Daly-BMS";
+            } else {
+                type = "JBD-BMS";
+            }
+        }
+
+        for (auto& dev : s_pInstance->m_discoveredDevices) {
+            if (dev.address.equalsIgnoreCase(addr)) {
+                dev.rssi = rssi;
+                if (dev.name.length() == 0 && name.length() > 0) dev.name = name;
+                if (type != "Unknown") dev.bms_type = type;
+                return;
+            }
+        }
+
+        BleDiscoveredDevice d;
+        d.name = name.length() > 0 ? name : "BMS Device";
+        d.address = addr;
+        d.rssi = rssi;
+        d.bms_type = type;
+        d.addr_type = advertisedDevice->getAddress().getType();
+        s_pInstance->m_discoveredDevices.push_back(d);
+
+        char logBuf[128];
+        sprintf(logBuf, "Found: %s [%s] RSSI:%d Type:%s", d.name.c_str(), addr.c_str(), rssi, type.c_str());
+        DebugLogger::info("SCAN", logBuf);
+    }
+
+    void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        processDevice(advertisedDevice);
+    }
+
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        processDevice(advertisedDevice);
+    }
+
+    void onScanEnd(const NimBLEScanResults& results, int reason) override {
+        char buf[64];
+        sprintf(buf, "Scan finished (found %d devices)", results.getCount());
+        DebugLogger::info("SCAN", buf);
+        if (s_pInstance) s_pInstance->m_isScanning = false;
+    }
+};
+
+BmsBleClient::BmsBleClient() {
+    s_pInstance = this;
+}
+
+bool BmsBleClient::init() {
+    NimBLEDevice::init("Universal-BMS-Probe");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setSecurityAuth(true, true, false);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
+    NimBLEDevice::setSecurityPasskey(123456);
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    pScan->setScanCallbacks(new BmsScanCallbacks());
+    pScan->setActiveScan(true);
+    pScan->setInterval(160);
+    pScan->setWindow(40);
+    DebugLogger::info(TAG, "BLE Client Initialized (P9 power, active scan, SMP passkey security enabled)");
+    return true;
+}
+
+void BmsBleClient::setTargetConfig(const AppConfig& cfg) {
+    m_config = cfg;
+    m_telemetry.cell_count = cfg.cell_count;
+}
+
+void BmsBleClient::startScan(uint32_t durationSeconds) {
+    if (m_isScanning) return;
+    m_discoveredDevices.clear();
+    m_isScanning = true;
+    m_lastScanStartTime = millis();
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    pScan->setInterval(160);
+    pScan->setWindow(40);
+    pScan->start(durationSeconds * 1000, false);
+    DebugLogger::info("SCAN", "Starting background BLE scan for " + String(durationSeconds) + "s");
+}
+
+String BmsBleClient::performScanSync(uint32_t durationSeconds) {
+    m_discoveredDevices.clear();
+    m_isScanning = true;
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    pScan->clearResults();
+    pScan->setActiveScan(true);
+    pScan->setInterval(100);
+    pScan->setWindow(90);
+    DebugLogger::info("SCAN", "Starting intensive active BLE scan for " + String(durationSeconds) + "s");
+    NimBLEScanResults results = pScan->getResults(durationSeconds * 1000, false);
+    m_isScanning = false;
+    return getDiscoveredDevicesJson();
+}
+
+std::vector<BleDiscoveredDevice> BmsBleClient::getDiscoveredDevices() {
+    return m_discoveredDevices;
+}
+
+String BmsBleClient::getDiscoveredDevicesJson() {
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (const auto& dev : m_discoveredDevices) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["name"] = dev.name;
+        obj["mac"] = dev.address;
+        obj["rssi"] = dev.rssi;
+        obj["type"] = dev.bms_type;
+    }
+    String json;
+    serializeJson(doc, json);
+    return json;
+}
+
+void BmsBleClient::loop() {
+    uint32_t now = millis();
+
+    if (m_isScanning && (now - m_lastScanStartTime > 7000)) {
+        m_isScanning = false;
+    }
+
+    if (!m_isConnected && !m_isScanning && (now - m_lastConnectAttempt > 4000)) {
+        m_lastConnectAttempt = now;
+
+        if (m_config.bms_mac.length() > 0) {
+            unsigned int firstByte = 0;
+            sscanf(m_config.bms_mac.c_str(), "%02x", &firstByte);
+            static bool s_tryAlt = false;
+            uint8_t primaryType = ((firstByte & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+            uint8_t secondaryType = (primaryType == BLE_ADDR_PUBLIC) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+            uint8_t useType = s_tryAlt ? secondaryType : primaryType;
+            s_tryAlt = !s_tryAlt;
+
+            NimBLEAddress targetAddr(std::string(m_config.bms_mac.c_str()), useType);
+            connectToDevice(targetAddr, m_config.bms_name, m_config.bms_type);
+        } else {
+            for (const auto& dev : m_discoveredDevices) {
+                if (dev.bms_type != "Unknown") {
+                    NimBLEAddress targetAddr(std::string(dev.address.c_str()), dev.addr_type);
+                    if (connectToDevice(targetAddr, dev.name, m_config.bms_type)) {
+                        break;
+                    }
+                }
+            }
+            if (!m_isConnected && m_discoveredDevices.empty() && (now - m_lastScanStartTime > 20000)) {
+                startScan(3);
+            }
+        }
+    }
+
+    // Polling logic
+    if (m_isConnected) {
+        if (m_telemetry.bms_type == "Daly-BMS") {
+            if (now - m_lastPollTime >= 200) {
+                m_lastPollTime = now;
+                static const uint8_t s_dalyCmds[] = { 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98 };
+                uint8_t cmd = s_dalyCmds[m_pollStep % (sizeof(s_dalyCmds)/sizeof(s_dalyCmds[0]))];
+                sendDalyCommand(cmd);
+                m_pollStep++;
+            }
+        } else if (now - m_lastPollTime >= 1000) {
+            m_lastPollTime = now;
+            if (m_telemetry.bms_type == "JBD-BMS") {
+                if (m_pollStep % 2 == 0) {
+                    sendJbdCommand(0xA5, 0x03); // Basic Info
+                } else {
+                    sendJbdCommand(0xA5, 0x04); // Cell Voltages
+                }
+                m_pollStep++;
+            } else if (m_telemetry.bms_type == "JK-BMS") {
+                if (m_telemetry.last_update == 0 || (now - m_telemetry.last_update > 4000)) {
+                    sendJkPollRequest();
+                }
+            }
+        }
+    }
+}
+
+bool BmsBleClient::connectToDevice(const NimBLEAddress& address, const String& name, uint8_t forcedType) {
+    char buf[128];
+    sprintf(buf, "Connecting to %s (type: %d, name: '%s', forced: %d)...", 
+            address.toString().c_str(), address.getType(), name.c_str(), forcedType);
+    DebugLogger::info(TAG, buf);
+
+    if (m_pClient == nullptr) {
+        m_pClient = NimBLEDevice::createClient();
+        m_pClient->setClientCallbacks(new BmsClientCallbacks(), false);
+        m_pClient->setConnectionParams(24, 48, 0, 400); // 30ms - 60ms interval, 4s timeout (Optimal for Wi-Fi & Tailscale coexistence)
+        m_pClient->setConnectTimeout(2500);
+    }
+
+    bool ok = m_pClient->connect(address, false);
+    if (!ok) {
+        DebugLogger::warn(TAG, "Connection attempt failed for address type " + String(address.getType()));
+        return false;
+    }
+
+    DebugLogger::info(TAG, "Connected! Discovering all services & characteristics...");
+    m_rxBuffer.clear();
+
+    std::vector<NimBLERemoteService*> services = m_pClient->getServices(true);
+    std::vector<NimBLERemoteCharacteristic*> notifyChars;
+    std::vector<NimBLERemoteCharacteristic*> writeChars;
+    NimBLERemoteService* pJkService = nullptr;
+
+    bool hasDalyFe00 = false;
+
+    for (auto* s : services) {
+        String sUuid = s->getUUID().toString().c_str();
+        sUuid.toLowerCase();
+        DebugLogger::info("DISC", "Found Service: " + sUuid);
+
+        if (sUuid.indexOf("ffe0") >= 0) {
+            pJkService = s;
+        }
+        if (sUuid.indexOf("fe00") >= 0 || sUuid.indexOf("02f00000") >= 0) {
+            hasDalyFe00 = true;
+        }
+
+        for (auto* c : s->getCharacteristics(true)) {
+            String cUuid = c->getUUID().toString().c_str();
+            cUuid.toLowerCase();
+            char cBuf[160];
+            sprintf(cBuf, "Svc [%s] Char [%s] H:%d [Notify:%d, Indic:%d, Wr:%d, WrNoResp:%d]",
+                    sUuid.c_str(), cUuid.c_str(), c->getHandle(), c->canNotify(), c->canIndicate(), c->canWrite(), c->canWriteNoResponse());
+            DebugLogger::info("DISC", cBuf);
+
+            if (c->canNotify() || c->canIndicate() || cUuid.indexOf("ff01") >= 0 || cUuid.indexOf("fff1") >= 0 || cUuid.indexOf("0002") >= 0) {
+                notifyChars.push_back(c);
+            }
+            if (c->canWrite() || c->canWriteNoResponse() || cUuid.indexOf("ff02") >= 0 || cUuid.indexOf("fff2") >= 0 || cUuid.indexOf("0003") >= 0) {
+                writeChars.push_back(c);
+            }
+        }
+    }
+
+    // 1. Process Daly BMS (Check first to avoid greedy JBD capture of FFF0/FFF1/FFF2)
+    bool isDalyCandidate = (forcedType == BMS_TYPE_DALY) || 
+                           hasDalyFe00 ||
+                           ((forcedType == BMS_TYPE_AUTO) && (name.startsWith("DL") || name.startsWith("BMS-") || name.indexOf("Daly") >= 0 || name.indexOf("DALY") >= 0));
+
+    if (isDalyCandidate) {
+        DebugLogger::info(TAG, "Attempting Daly BMS protocol negotiation...");
+        m_pDalyNotifyChar = nullptr;
+        m_pDalyWriteChar = nullptr;
+
+        // Search for Daly characteristics: FFF1/FFF2 (standard) or FFE1/FFE2 or 6E400003/6E400002 (NUS)
+        for (auto* s : services) {
+            for (auto* c : s->getCharacteristics(true)) {
+                String uuid = c->getUUID().toString().c_str();
+                uuid.toLowerCase();
+                if (uuid.indexOf("fff1") >= 0 || uuid.indexOf("ffe1") >= 0 || uuid.indexOf("6e400003") >= 0) {
+                    m_pDalyNotifyChar = c;
+                }
+                if (uuid.indexOf("fff2") >= 0 || uuid.indexOf("ffe2") >= 0 || uuid.indexOf("6e400002") >= 0) {
+                    m_pDalyWriteChar = c;
+                }
+            }
+        }
+
+        // Generic fallback if not matched by specific UUID string
+        if (!m_pDalyNotifyChar || !m_pDalyWriteChar) {
+            for (auto* s : services) {
+                String sUuid = s->getUUID().toString().c_str();
+                sUuid.toLowerCase();
+                if (sUuid.indexOf("fe00") >= 0 && services.size() > 1) continue; // skip proprietary config service
+
+                for (auto* c : s->getCharacteristics(true)) {
+                    if (!m_pDalyNotifyChar && (c->canNotify() || c->canIndicate())) {
+                        m_pDalyNotifyChar = c;
+                    }
+                    if (!m_pDalyWriteChar && (c->canWrite() || c->canWriteNoResponse())) {
+                        m_pDalyWriteChar = c;
+                    }
+                }
+            }
+        }
+
+        if (!m_pDalyWriteChar && m_pDalyNotifyChar && (m_pDalyNotifyChar->canWrite() || m_pDalyNotifyChar->canWriteNoResponse())) {
+            m_pDalyWriteChar = m_pDalyNotifyChar;
+        }
+
+        if (m_pDalyNotifyChar && m_pDalyWriteChar) {
+            m_pDalyNotifyChar->subscribe(true, [this](NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+                this->handleDalyPacket(pData, length);
+            });
+            m_dalyWriteWithResponse = m_pDalyWriteChar->canWrite() && !m_pDalyWriteChar->canWriteNoResponse();
+            DebugLogger::info(TAG, "Selected Daly BMS: Notify H:" + String(m_pDalyNotifyChar->getHandle()) + 
+                                  ", Write H:" + String(m_pDalyWriteChar->getHandle()) + 
+                                  " (WithResponse: " + String(m_dalyWriteWithResponse) + ")");
+
+            m_isConnected = true;
+            m_telemetry.connected = true;
+            m_telemetry.bms_type = "Daly-BMS";
+            m_telemetry.device_name = name.length() > 0 ? name : "Daly-BMS";
+            m_telemetry.mac_address = address.toString().c_str();
+            m_telemetry.last_update = millis();
+
+            // Initial query
+            sendDalyCommand(0x90);
+            delay(100);
+            sendDalyCommand(0x94);
+            return true;
+        } else {
+            DebugLogger::warn(TAG, "Daly candidate detected but characteristics not resolved, checking other protocols...");
+        }
+    }
+
+    // 2. Process JBD (if not JK service, not Daly, or if forcedType is JBD)
+    if (!notifyChars.empty() && !writeChars.empty() && (forcedType == BMS_TYPE_AUTO || forcedType == BMS_TYPE_JBD) && (!pJkService || forcedType == BMS_TYPE_JBD)) {
+        if (m_config.bms_pin.length() > 0) {
+            DebugLogger::info(TAG, "Securing JBD connection with Passkey: " + m_config.bms_pin);
+            m_pClient->secureConnection();
+        }
+        m_pJbdNotifyChar = notifyChars[0];
+        m_pJbdWriteChar  = writeChars[0];
+
+        // Prefer FF01/FF02 if available
+        for (auto* c : notifyChars) {
+            String u = c->getUUID().toString().c_str();
+            u.toLowerCase();
+            if (u.indexOf("ff01") >= 0 || u.indexOf("fff1") >= 0 || u.indexOf("0002") >= 0) {
+                m_pJbdNotifyChar = c;
+                break;
+            }
+        }
+        for (auto* c : writeChars) {
+            String u = c->getUUID().toString().c_str();
+            u.toLowerCase();
+            if (u.indexOf("ff02") >= 0 || u.indexOf("fff2") >= 0 || u.indexOf("0003") >= 0) {
+                m_pJbdWriteChar = c;
+                break;
+            }
+        }
+
+        m_jbdWriteWithResponse = m_pJbdWriteChar->canWrite() && !m_pJbdWriteChar->canWriteNoResponse();
+        DebugLogger::info(TAG, "Selected JBD Primary: Notify H:" + String(m_pJbdNotifyChar->getHandle()) + 
+                              ", Write H:" + String(m_pJbdWriteChar->getHandle()) + 
+                              " (WithResponse: " + String(m_jbdWriteWithResponse) + ")");
+
+        // Subscribe to all notification candidates
+        for (auto* nc : notifyChars) {
+            bool subRes = nc->subscribe(true, [this](NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+                this->handleJbdPacket(pData, length);
+            });
+            DebugLogger::info(TAG, "Subscribed to H:" + String(nc->getHandle()) + " (" + String(nc->getUUID().toString().c_str()) + ") -> Status: " + String(subRes ? "SUCCESS" : "FAILED"));
+        }
+
+        m_isConnected = true;
+        m_telemetry.connected = true;
+        m_telemetry.bms_type = "JBD-BMS";
+        m_telemetry.device_name = name.length() > 0 ? name : "JBD-BMS";
+        m_telemetry.mac_address = address.toString().c_str();
+        m_telemetry.last_update = millis();
+
+        // Standard JBD Interrogation:
+        // First try standard query 0x03 & 0x04 without noisy AT frames
+        sendJbdCommand(0xA5, 0x03);
+        delay(80);
+        sendJbdCommand(0xA5, 0x04);
+        delay(80);
+
+        // Also send standard PIN unlock register (0x01) if PIN is configured
+        String pinToTry = m_config.bms_pin.length() > 0 ? m_config.bms_pin : "123456";
+        if (pinToTry.length() == 6) {
+            uint8_t pinFrame[13];
+            pinFrame[0] = 0xDD;
+            pinFrame[1] = 0x5A;
+            pinFrame[2] = 0x01; // Register 0x01 = Password
+            pinFrame[3] = 0x06;
+            for (int i = 0; i < 6; ++i) pinFrame[4 + i] = pinToTry[i];
+            uint32_t sum = 0x01 + 0x06;
+            for (int i = 0; i < 6; ++i) sum += pinToTry[i];
+            uint16_t crc = (uint16_t)(0x10000 - sum);
+            pinFrame[10] = (uint8_t)(crc >> 8);
+            pinFrame[11] = (uint8_t)(crc & 0xFF);
+            pinFrame[12] = 0x77;
+            DebugLogger::logTx(TAG, pinFrame, 13, "JBD Reg 0x01 PIN Unlock ('" + pinToTry + "')");
+            m_pJbdWriteChar->writeValue(pinFrame, 13, m_jbdWriteWithResponse);
+        }
+
+        return true;
+    }
+
+    // 3. Process JK Service (0xFFE0)
+    if (pJkService && (forcedType == BMS_TYPE_AUTO || forcedType == BMS_TYPE_JK)) {
+        DebugLogger::info(TAG, "Selected JK Service (0xFFE0)");
+        m_pJkNotifyChar = nullptr;
+        m_pJkWriteChar = nullptr;
+
+        for (auto* c : pJkService->getCharacteristics(true)) {
+            String uuid = c->getUUID().toString().c_str();
+            uuid.toLowerCase();
+            if (uuid.indexOf("ffe2") >= 0 || (c->canWriteNoResponse() && !c->canNotify())) {
+                m_pJkWriteChar = c;
+            }
+            if (uuid.indexOf("ffe1") >= 0 || c->canNotify()) {
+                m_pJkNotifyChar = c;
+                c->subscribe(true, [this](NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+                    this->handleJkPacket(pData, length);
+                });
+                DebugLogger::info(TAG, "Subscribed to JK Notify H:" + String(c->getHandle()));
+            }
+        }
+
+        if (!m_pJkWriteChar && m_pJkNotifyChar) {
+            m_pJkWriteChar = m_pJkNotifyChar;
+        }
+
+        if (m_pJkNotifyChar) {
+            m_isConnected = true;
+            m_telemetry.connected = true;
+            m_telemetry.bms_type = "JK-BMS";
+            m_telemetry.device_name = name.length() > 0 ? name : "JK-BMS";
+            m_telemetry.mac_address = address.toString().c_str();
+            m_telemetry.last_update = millis();
+
+            NimBLERemoteCharacteristic* writeChar = m_pJkWriteChar ? m_pJkWriteChar : m_pJkNotifyChar;
+            auto frameDev = buildJkFrame(0x97, 0, 0);
+            DebugLogger::logTx(TAG, frameDev.data(), frameDev.size(), "JK DeviceInfo (0x97)");
+            if (writeChar) {
+                writeChar->writeValue(frameDev.data(), frameDev.size(), false);
+            }
+            delay(250);
+
+            sendJkPollRequest();
+            return true;
+        }
+    }
+
+    DebugLogger::error(TAG, "No usable JBD (FF00/FFF0/FEE7), JK (FFE0), or Daly (FFE0) characteristics discovered");
+    disconnect();
+    return false;
+}
+
+void BmsBleClient::disconnect() {
+    if (m_pClient && m_pClient->isConnected()) {
+        m_pClient->disconnect();
+    }
+    m_isConnected = false;
+    m_telemetry.connected = false;
+    m_pJbdNotifyChar = nullptr;
+    m_pJbdWriteChar  = nullptr;
+    m_pJkNotifyChar  = nullptr;
+    m_pJkWriteChar   = nullptr;
+    m_pDalyNotifyChar = nullptr;
+    m_pDalyWriteChar  = nullptr;
+    m_rxBuffer.clear();
+}
+
+void BmsBleClient::reconnect() {
+    DebugLogger::info(TAG, "Manual reconnection triggered by user");
+    disconnect();
+    m_lastConnectAttempt = 0;
+}
+
+bool BmsBleClient::sendRawBle(const uint8_t* data, size_t len) {
+    if (!m_isConnected) {
+        DebugLogger::error(TAG, "sendRawBle failed: not connected to any BMS");
+        return false;
+    }
+    if (m_pJbdWriteChar) {
+        DebugLogger::logTx(TAG, data, len, "Raw JBD Frame");
+        bool ok = m_pJbdWriteChar->writeValue(data, len, false);
+        if (!ok && m_pJbdWriteChar->canWrite()) {
+            ok = m_pJbdWriteChar->writeValue(data, len, true);
+        }
+        return ok;
+    }
+    if (m_pJkWriteChar) {
+        DebugLogger::logTx(TAG, data, len, "Raw JK Frame");
+        return m_pJkWriteChar->writeValue(data, len, false);
+    }
+    DebugLogger::error(TAG, "sendRawBle failed: no active write characteristic");
+    return false;
+}
+
+// ======================== JBD Implementation ========================
+
+void BmsBleClient::sendJbdCommand(uint8_t cmd, uint8_t reg, const uint8_t* payload, uint8_t len) {
+    if (!m_pJbdWriteChar || !m_isConnected) return;
+
+    size_t totalLen = 7 + len;
+    uint8_t frame[64];
+    frame[0] = 0xDD;
+    frame[1] = cmd;
+    frame[2] = reg;
+    frame[3] = len;
+
+    if (payload && len > 0) {
+        memcpy(&frame[4], payload, len);
+    }
+
+    uint32_t sum = reg + len;
+    for (size_t i = 0; i < len; ++i) sum += payload[i];
+    uint16_t crc = (uint16_t)(0x10000 - sum);
+
+    frame[4 + len] = (uint8_t)(crc >> 8);
+    frame[5 + len] = (uint8_t)(crc & 0xFF);
+    frame[6 + len] = 0x77;
+
+    char descBuf[32];
+    sprintf(descBuf, "JBD Cmd:0x%02X Reg:0x%02X", cmd, reg);
+    DebugLogger::logTx(TAG, frame, totalLen, descBuf);
+
+    m_pJbdWriteChar->writeValue(frame, totalLen, m_jbdWriteWithResponse);
+}
+
+void BmsBleClient::handleJbdPacket(const uint8_t* data, size_t len) {
+    if (len == 0) return;
+
+    DebugLogger::logRx(TAG, data, len, "JBD Rx Chunk");
+
+    m_rxBuffer.insert(m_rxBuffer.end(), data, data + len);
+
+    if (m_rxBuffer.size() > 512) {
+        DebugLogger::warn(TAG, "Rx buffer overflow >512, resetting");
+        m_rxBuffer.clear();
+        return;
+    }
+
+    while (!m_rxBuffer.empty()) {
+        // Module Response (FF AA <cmd> <len> <data...> <chk>)
+        if (m_rxBuffer.size() >= 2 && m_rxBuffer[0] == 0xFF && m_rxBuffer[1] == 0xAA) {
+            if (m_rxBuffer.size() < 4) return;
+            uint8_t modCmd = m_rxBuffer[2];
+            uint8_t modLen = m_rxBuffer[3];
+            size_t totalModLen = 4 + modLen + 1;
+            if (m_rxBuffer.size() < totalModLen) return;
+
+            char buf[64];
+            sprintf(buf, "JBD Module Resp 0x%02X (len %u)", modCmd, modLen);
+            DebugLogger::info(TAG, buf);
+            m_rxBuffer.erase(m_rxBuffer.begin(), m_rxBuffer.begin() + totalModLen);
+            continue;
+        }
+
+        // Align to 0xDD
+        if (m_rxBuffer[0] != 0xDD) {
+            m_rxBuffer.erase(m_rxBuffer.begin());
+            continue;
+        }
+
+        if (m_rxBuffer.size() < 7) return;
+
+        uint8_t reg = m_rxBuffer[1];
+        uint8_t status = m_rxBuffer[2];
+        uint8_t dataLen = m_rxBuffer[3];
+        size_t expectedLen = 4 + dataLen + 2 + 1;
+
+        if (m_rxBuffer.size() < expectedLen) return;
+
+        if (m_rxBuffer[expectedLen - 1] != 0x77) {
+            DebugLogger::warn(TAG, "JBD Frame missing 0x77 terminator, skipping byte");
+            m_rxBuffer.erase(m_rxBuffer.begin());
+            continue;
+        }
+
+        std::vector<uint8_t> frame(m_rxBuffer.begin(), m_rxBuffer.begin() + expectedLen);
+        m_rxBuffer.erase(m_rxBuffer.begin(), m_rxBuffer.begin() + expectedLen);
+
+        if (status != 0x00) {
+            char buf[64];
+            sprintf(buf, "JBD Reg 0x%02X Error Status: 0x%02X", reg, status);
+            DebugLogger::warn(TAG, buf);
+            continue;
+        }
+
+        if (reg == 0x03) {
+            decodeJbdTelemetry(frame);
+        } else if (reg == 0x04) {
+            decodeJbdCells(frame);
+        } else if (reg == 0x05) {
+            String devName = "";
+            for (size_t i = 0; i < dataLen; ++i) {
+                char c = (char)frame[4 + i];
+                if (c >= 32 && c <= 126) devName += c;
+            }
+            if (devName.length() > 0) {
+                m_telemetry.device_name = devName;
+                DebugLogger::info(TAG, "JBD Device Name: " + devName);
+            }
+        } else if (reg == 0x10 || reg == 0x11 || reg == 0x2F || reg == 0x12 || reg == 0x20) {
+            decodeJbdEeprom(reg, frame);
+        }
+    }
+}
+
+void BmsBleClient::decodeJbdEeprom(uint8_t reg, const std::vector<uint8_t>& data) {
+    if (data.size() < 6) return;
+    uint8_t dataLen = data[3];
+    auto get16 = [&](size_t idx) -> uint16_t {
+        return (uint16_t(data[idx]) << 8) | uint16_t(data[idx + 1]);
+    };
+
+    if (reg == 0x10 && dataLen >= 2) { // design_cap (10mAh)
+        m_telemetry.capacity_nominal_setting = (float)get16(4) * 0.01f;
+        m_telemetry.capacity_total = m_telemetry.capacity_nominal_setting;
+        DebugLogger::info(TAG, "EEPROM Read: Nominal Capacity = " + String(m_telemetry.capacity_nominal_setting, 2) + " Ah");
+    } else if (reg == 0x11 && dataLen >= 2) { // cycle_cap (10mAh)
+        m_telemetry.capacity_cycle_setting = (float)get16(4) * 0.01f;
+        m_telemetry.cycle_capacity = m_telemetry.capacity_cycle_setting;
+        DebugLogger::info(TAG, "EEPROM Read: Cycle Capacity = " + String(m_telemetry.capacity_cycle_setting, 2) + " Ah");
+    } else if (reg == 0x2F && dataLen >= 1) { // cell_cnt
+        uint8_t cnt = (dataLen >= 2) ? data[5] : data[4];
+        if (cnt >= 3 && cnt <= 32) {
+            m_telemetry.cell_count = cnt;
+            DebugLogger::info(TAG, "EEPROM Read: Cell Count = " + String(cnt) + "S");
+        }
+    } else if ((reg == 0x12 || reg == 0x20) && dataLen >= 2) { // Full charge voltage / cell overvoltage threshold (mV)
+        m_telemetry.cell_full_voltage_setting = get16(4);
+        DebugLogger::info(TAG, "EEPROM Read: Cell Full Voltage = " + String(m_telemetry.cell_full_voltage_setting) + " mV");
+    }
+}
+
+void BmsBleClient::decodeJbdTelemetry(const std::vector<uint8_t>& data) {
+    if (data.size() < 4 + 23) return;
+
+    auto get16 = [&](size_t idx) -> uint16_t {
+        return (uint16_t(data[idx]) << 8) | uint16_t(data[idx + 1]);
+    };
+
+    m_telemetry.total_voltage = (float)get16(4) * 0.01f;
+    int16_t rawCurrent = (int16_t)get16(6);
+    m_telemetry.current = (float)rawCurrent * 0.01f;
+    m_telemetry.power = m_telemetry.total_voltage * m_telemetry.current;
+    if (m_telemetry.power >= 0) {
+        m_telemetry.charge_power = m_telemetry.power;
+        m_telemetry.discharge_power = 0.0f;
+    } else {
+        m_telemetry.charge_power = 0.0f;
+        m_telemetry.discharge_power = -m_telemetry.power;
+    }
+
+    m_telemetry.capacity_remain = (float)get16(8) * 0.01f;
+    m_telemetry.capacity_total  = (float)get16(10) * 0.01f;
+    m_telemetry.cycle_count     = get16(12);
+
+    uint8_t reportedCellCount = data[25];
+    if (reportedCellCount >= 3 && reportedCellCount <= 32) {
+        m_telemetry.cell_count = reportedCellCount;
+    }
+
+    uint8_t ntcCount = data[26];
+    if (ntcCount > 0 && data.size() >= 4 + 23 + (ntcCount * 2)) {
+        int16_t rawT1 = (int16_t)get16(27);
+        m_telemetry.temp_sensor1 = ((float)rawT1 - 2731.0f) * 0.1f;
+        if (ntcCount > 1) {
+            int16_t rawT2 = (int16_t)get16(29);
+            m_telemetry.temp_sensor2 = ((float)rawT2 - 2731.0f) * 0.1f;
+            m_telemetry.temp_mos = m_telemetry.temp_sensor2;
+        } else {
+            m_telemetry.temp_mos = m_telemetry.temp_sensor1;
+        }
+    }
+
+    if (data.size() >= 4 + 20) {
+        m_telemetry.soc = (float)data[23];
+        uint8_t mosStatus = data[24];
+        m_telemetry.switch_charging    = (mosStatus & 0x01) != 0;
+        m_telemetry.switch_discharging = (mosStatus & 0x02) != 0;
+    }
+
+    if (data.size() >= 4 + 18) {
+        m_telemetry.raw_errors = get16(20);
+        m_telemetry.errors_str = (m_telemetry.raw_errors == 0) ? "OK (Без помилок)" : ("0x" + String(m_telemetry.raw_errors, HEX));
+    }
+
+    m_telemetry.last_update = millis();
+    m_telemetry.connected = true;
+
+    char buf[128];
+    sprintf(buf, "JBD Telemetry: V=%.2fV, I=%.2fA, SOC=%.0f%%, Cells=%d, Errors: %s",
+            m_telemetry.total_voltage, m_telemetry.current, m_telemetry.soc, m_telemetry.cell_count, m_telemetry.errors_str.c_str());
+    DebugLogger::info(TAG, buf);
+}
+
+void BmsBleClient::decodeJbdCells(const std::vector<uint8_t>& data) {
+    if (data.size() < 6) return;
+    uint8_t dataLen = data[3];
+    uint8_t numCells = dataLen / 2;
+    if (numCells > 32) numCells = 32;
+
+    float minV = 999.0f;
+    float maxV = 0.0f;
+    uint8_t minIdx = 1;
+    uint8_t maxIdx = 1;
+
+    for (uint8_t i = 0; i < numCells; ++i) {
+        uint16_t rawMv = (uint16_t(data[4 + i * 2]) << 8) | uint16_t(data[4 + i * 2 + 1]);
+        float v = (float)rawMv * 0.001f;
+        m_telemetry.cell_voltages[i] = v;
+
+        if (v > 0.5f) {
+            if (v < minV) {
+                minV = v;
+                minIdx = i + 1;
+            }
+            if (v > maxV) {
+                maxV = v;
+                maxIdx = i + 1;
+            }
+        }
+    }
+
+    m_telemetry.min_cell_v = (minV < 900.0f) ? minV : 0.0f;
+    m_telemetry.max_cell_v = maxV;
+    m_telemetry.delta_cell_v = (maxV > minV) ? (maxV - minV) : 0.0f;
+    m_telemetry.min_cell_idx = minIdx;
+    m_telemetry.max_cell_idx = maxIdx;
+    m_telemetry.last_update = millis();
+
+    char buf[128];
+    sprintf(buf, "JBD Cells: Delta=%.3fV (Min C%d=%.3fV, Max C%d=%.3fV)",
+            m_telemetry.delta_cell_v, minIdx, m_telemetry.min_cell_v, maxIdx, m_telemetry.max_cell_v);
+    DebugLogger::info(TAG, buf);
+}
+
+// ======================== JK Implementation ========================
+
+std::vector<uint8_t> BmsBleClient::buildJkFrame(uint8_t address, uint32_t value, uint8_t length) {
+    std::vector<uint8_t> frame(20, 0x00);
+    frame[0] = 0xAA;
+    frame[1] = 0x55;
+    frame[2] = 0x90;
+    frame[3] = 0xEB;
+    frame[4] = address;
+    frame[5] = length;
+    frame[6] = (value >> 0) & 0xFF;
+    frame[7] = (value >> 8) & 0xFF;
+    frame[8] = (value >> 16) & 0xFF;
+    frame[9] = (value >> 24) & 0xFF;
+
+    uint8_t crc = 0;
+    for (size_t i = 0; i < 19; ++i) crc += frame[i];
+    frame[19] = crc;
+    return frame;
+}
+
+void BmsBleClient::sendJkPollRequest() {
+    if (!m_isConnected) return;
+    NimBLERemoteCharacteristic* writeChar = m_pJkWriteChar ? m_pJkWriteChar : m_pJkNotifyChar;
+    if (!writeChar) return;
+    auto frame = buildJkFrame(0x96, 0, 0);
+    DebugLogger::logTx(TAG, frame.data(), frame.size(), "JK CellInfo (0x96)");
+    writeChar->writeValue(frame.data(), frame.size(), false);
+}
+
+void BmsBleClient::handleJkPacket(const uint8_t* data, size_t len) {
+    if (len == 0) return;
+
+    if (m_rxBuffer.size() > 500) {
+        m_rxBuffer.clear();
+    }
+    // If packet starts with JK response header 0x55 0xAA 0xEB 0x90, reset buffer
+    if (len >= 4 && data[0] == 0x55 && data[1] == 0xAA && data[2] == 0xEB && data[3] == 0x90) {
+        m_rxBuffer.clear();
+    }
+
+    m_rxBuffer.insert(m_rxBuffer.end(), data, data + len);
+
+    if (m_rxBuffer.size() >= 5 && m_rxBuffer[0] == 0x55 && m_rxBuffer[1] == 0xAA && m_rxBuffer[2] == 0xEB && m_rxBuffer[3] == 0x90) {
+        uint8_t frameType = m_rxBuffer[4];
+        if (frameType == 0x01 && m_rxBuffer.size() >= 130) {
+            decodeJkSettings(m_rxBuffer);
+            m_rxBuffer.clear();
+        } else if (frameType == 0x02 && m_rxBuffer.size() >= 300) {
+            decodeJkCellInfo(m_rxBuffer);
+            m_rxBuffer.clear();
+        }
+    }
+}
+
+void BmsBleClient::decodeJkSettings(const std::vector<uint8_t>& data) {
+    if (data.size() < 130) return;
+    // Charge switch at 118, Discharge switch at 122, Balancer switch at 126
+    m_telemetry.switch_charging    = (data[118] != 0);
+    m_telemetry.switch_discharging = (data[122] != 0);
+    m_telemetry.switch_balancer    = (data[126] != 0);
+    m_telemetry.last_update = millis();
+    char buf[128];
+    sprintf(buf, "JK Settings: Charge=%d, Discharge=%d, Balancer=%d",
+            m_telemetry.switch_charging, m_telemetry.switch_discharging, m_telemetry.switch_balancer);
+    DebugLogger::info(TAG, buf);
+}
+
+void BmsBleClient::decodeJkCellInfo(const std::vector<uint8_t>& data) {
+    if (data.size() < 300) return;
+
+    auto get16 = [&](size_t i) -> uint16_t {
+        if (i + 1 >= data.size()) return 0;
+        return (uint16_t(data[i + 1]) << 8) | uint16_t(data[i]);
+    };
+    auto get32 = [&](size_t i) -> uint32_t {
+        return (uint32_t(get16(i + 2)) << 16) | uint32_t(get16(i));
+    };
+
+    // Detect 32S offset vs 24S offset
+    size_t offset = 0;
+    float v32 = (float)get32(150) * 0.001f;
+    float v24 = (float)get32(118) * 0.001f;
+    if (v32 >= 8.0f && v32 <= 80.0f) {
+        offset = 32; // JK02_32S protocol
+    } else if (v24 >= 8.0f && v24 <= 80.0f) {
+        offset = 0;  // JK02_24S protocol
+    } else {
+        offset = 32; // Default to 32S
+    }
+
+    // Cell Voltages (bytes 6 + i * 2)
+    float minV = 999.0f;
+    float maxV = 0.0f;
+    uint8_t minIdx = 1;
+    uint8_t maxIdx = 1;
+    uint8_t detectedCells = 0;
+
+    for (int i = 0; i < 32; i++) {
+        float v = (float)get16(6 + i * 2) * 0.001f;
+        if (v >= 0.5f && v <= 5.0f) {
+            m_telemetry.cell_voltages[i] = v;
+            detectedCells = i + 1;
+            if (v < minV) {
+                minV = v;
+                minIdx = i + 1;
+            }
+            if (v > maxV) {
+                maxV = v;
+                maxIdx = i + 1;
+            }
+        } else {
+            m_telemetry.cell_voltages[i] = 0.0f;
+        }
+    }
+
+    if (detectedCells > 0) {
+        m_telemetry.cell_count = detectedCells;
+    } else if (m_config.cell_count > 0) {
+        m_telemetry.cell_count = m_config.cell_count;
+    }
+
+    m_telemetry.min_cell_v = (minV < 900.0f) ? minV : 0.0f;
+    m_telemetry.max_cell_v = maxV;
+    m_telemetry.delta_cell_v = (maxV > minV && minV < 900.0f) ? (maxV - minV) : 0.0f;
+    m_telemetry.min_cell_idx = minIdx;
+    m_telemetry.max_cell_idx = maxIdx;
+
+    m_telemetry.total_voltage = (float)get32(118 + offset) * 0.001f;
+
+    // Current (signed 32-bit: positive = charge, negative = discharge)
+    int32_t rawCurrent = (int32_t)get32(126 + offset);
+    m_telemetry.current = (float)rawCurrent * 0.001f;
+    m_telemetry.power = m_telemetry.total_voltage * m_telemetry.current;
+    if (m_telemetry.power >= 0) {
+        m_telemetry.charge_power = m_telemetry.power;
+        m_telemetry.discharge_power = 0.0f;
+    } else {
+        m_telemetry.charge_power = 0.0f;
+        m_telemetry.discharge_power = -m_telemetry.power;
+    }
+
+    // Temperatures
+    m_telemetry.temp_sensor1 = (float)((int16_t)get16(130 + offset)) * 0.1f;
+    m_telemetry.temp_sensor2 = (float)((int16_t)get16(132 + offset)) * 0.1f;
+    if (offset == 32) {
+        m_telemetry.temp_mos = (float)((int16_t)get16(112 + offset)) * 0.1f;
+    } else {
+        m_telemetry.temp_mos = (float)((int16_t)get16(134 + offset)) * 0.1f;
+    }
+
+    // Balancer
+    m_telemetry.balancing_current = (float)((int16_t)get16(138 + offset)) * 0.001f;
+    uint8_t balState = (140 + offset < data.size()) ? data[140 + offset] : 0;
+    m_telemetry.balancing_active = (balState != 0);
+
+    // SOC & Capacity
+    if (141 + offset < data.size()) {
+        m_telemetry.soc = (float)data[141 + offset];
+    }
+    m_telemetry.capacity_remain = (float)get32(142 + offset) * 0.001f;
+    m_telemetry.capacity_total  = (float)get32(146 + offset) * 0.001f;
+
+    // Cycle Count
+    m_telemetry.cycle_count = get32(150 + offset);
+
+    // Errors bitmask
+    uint32_t errs = get32(134 + offset);
+    m_telemetry.raw_errors = errs;
+    m_telemetry.errors_str = (errs == 0) ? "OK (Без помилок)" : ("0x" + String(errs, HEX));
+
+    // Real-time switch states from live cell info frame
+    if (167 + offset < data.size()) {
+        m_telemetry.switch_charging    = (data[166 + offset] != 0);
+        m_telemetry.switch_discharging = (data[167 + offset] != 0);
+    }
+
+    m_telemetry.connected = true;
+    m_telemetry.last_update = millis();
+
+    char buf[160];
+    sprintf(buf, "JK Telemetry (%dS): V=%.2fV, I=%.2fA, SOC=%.0f%%, Delta=%.3fV (Min=C%d:%.3fV, Max=C%d:%.3fV)",
+            m_telemetry.cell_count,
+            m_telemetry.total_voltage, m_telemetry.current, m_telemetry.soc,
+            m_telemetry.delta_cell_v,
+            m_telemetry.min_cell_idx, m_telemetry.min_cell_v,
+            m_telemetry.max_cell_idx, m_telemetry.max_cell_v);
+    DebugLogger::info(TAG, buf);
+}
+
+bool BmsBleClient::setSwitch(const String& sw, bool state) {
+    if (!m_isConnected) {
+        DebugLogger::error(TAG, "setSwitch failed: not connected");
+        return false;
+    }
+
+    if (m_telemetry.bms_type == "JBD-BMS") {
+        uint8_t mosPayload[2];
+        uint8_t currentChg = m_telemetry.switch_charging ? 0 : 1;
+        uint8_t currentDsg = m_telemetry.switch_discharging ? 0 : 2;
+
+        if (sw == "charging") currentChg = state ? 0 : 1;
+        if (sw == "discharging") currentDsg = state ? 0 : 2;
+
+        mosPayload[0] = 0x00;
+        mosPayload[1] = currentChg | currentDsg;
+
+        sendJbdCommand(0x5A, 0xE1, mosPayload, 2);
+        if (sw == "charging") m_telemetry.switch_charging = state;
+        if (sw == "discharging") m_telemetry.switch_discharging = state;
+        return true;
+    } else if (m_telemetry.bms_type == "JK-BMS") {
+        uint8_t reg = 0;
+        if (sw == "charging") reg = 0x1D;
+        else if (sw == "discharging") reg = 0x1E;
+        else if (sw == "balancer") reg = 0x1F;
+        if (reg == 0) return false;
+
+        auto frame = buildJkFrame(reg, state ? 1 : 0, 4);
+        DebugLogger::logTx(TAG, frame.data(), frame.size(), "JK Switch " + sw);
+        NimBLERemoteCharacteristic* writeChar = m_pJkWriteChar ? m_pJkWriteChar : m_pJkNotifyChar;
+        if (writeChar) {
+            bool ok = writeChar->writeValue(frame.data(), frame.size(), false);
+            if (ok) {
+                if (sw == "charging") m_telemetry.switch_charging = state;
+                else if (sw == "discharging") m_telemetry.switch_discharging = state;
+                else if (sw == "balancer") m_telemetry.switch_balancer = state;
+            }
+            return ok;
+        }
+    } else if (m_telemetry.bms_type == "Daly-BMS") {
+        if (sw == "charging") {
+            uint8_t payload[8] = { (uint8_t)(state ? 0x01 : 0x00), 0, 0, 0, 0, 0, 0, 0 };
+            sendDalyCommand(0xDA, payload);
+            m_telemetry.switch_charging = state;
+            return true;
+        } else if (sw == "discharging") {
+            uint8_t payload[8] = { (uint8_t)(state ? 0x01 : 0x00), 0, 0, 0, 0, 0, 0, 0 };
+            sendDalyCommand(0xD9, payload);
+            m_telemetry.switch_discharging = state;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BmsBleClient::readJbdCapacityParams() {
+    if (!m_isConnected || m_telemetry.bms_type != "JBD-BMS") {
+        DebugLogger::warn(TAG, "readJbdCapacityParams failed: not connected to JBD BMS");
+        return false;
+    }
+    DebugLogger::info(TAG, "Reading JBD EEPROM configuration parameters...");
+
+    // 1. Enter factory mode
+    uint8_t enterPayload[2] = { 0x56, 0x78 };
+    sendJbdCommand(0x5A, 0x00, enterPayload, 2);
+    delay(50);
+
+    // 2. Read design_cap (0x10), cycle_cap (0x11), cell_cnt (0x2F), full_voltage (0x12)
+    sendJbdCommand(0xA5, 0x10);
+    delay(50);
+    sendJbdCommand(0xA5, 0x11);
+    delay(50);
+    sendJbdCommand(0xA5, 0x2F);
+    delay(50);
+    sendJbdCommand(0xA5, 0x12);
+    delay(50);
+
+    // 3. Exit factory mode (without writing 0x2828)
+    uint8_t exitPayload[2] = { 0x00, 0x00 };
+    sendJbdCommand(0x5A, 0x01, exitPayload, 2);
+    return true;
+}
+
+bool BmsBleClient::writeJbdCapacityParams(float nominalAh, float cycleAh, uint8_t cellCount, uint16_t fullMv) {
+    if (!m_isConnected || m_telemetry.bms_type != "JBD-BMS") {
+        DebugLogger::warn(TAG, "writeJbdCapacityParams failed: not connected to JBD BMS");
+        return false;
+    }
+
+    char logBuf[160];
+    sprintf(logBuf, "Writing JBD EEPROM: Nom=%.1fAh, Cyc=%.1fAh, Cells=%dS, Full=%dmV", nominalAh, cycleAh, cellCount, fullMv);
+    DebugLogger::info(TAG, logBuf);
+
+    // 1. Enter factory mode (0x00 -> 0x5678)
+    uint8_t enterPayload[2] = { 0x56, 0x78 };
+    sendJbdCommand(0x5A, 0x00, enterPayload, 2);
+    delay(100);
+
+    // 2. Write Nominal Capacity (0x10, unit: 10mAh -> val = Ah * 100)
+    if (nominalAh > 0.5f) {
+        uint16_t nomVal = (uint16_t)(nominalAh * 100.0f);
+        uint8_t pNom[2] = { (uint8_t)(nomVal >> 8), (uint8_t)(nomVal & 0xFF) };
+        sendJbdCommand(0x5A, 0x10, pNom, 2);
+        delay(80);
+    }
+
+    // 3. Write Cycle Capacity (0x11, unit: 10mAh -> val = Ah * 100)
+    if (cycleAh > 0.5f) {
+        uint16_t cycVal = (uint16_t)(cycleAh * 100.0f);
+        uint8_t pCyc[2] = { (uint8_t)(cycVal >> 8), (uint8_t)(cycVal & 0xFF) };
+        sendJbdCommand(0x5A, 0x11, pCyc, 2);
+        delay(80);
+    }
+
+    // 4. Write Cell Count (0x2F)
+    if (cellCount >= 3 && cellCount <= 32) {
+        uint8_t pCnt[2] = { 0x00, cellCount };
+        sendJbdCommand(0x5A, 0x2F, pCnt, 2);
+        delay(80);
+    }
+
+    // 5. Write Full / Overvoltage threshold (0x12)
+    if (fullMv >= 2000 && fullMv <= 4500) {
+        uint8_t pMv[2] = { (uint8_t)(fullMv >> 8), (uint8_t)(fullMv & 0xFF) };
+        sendJbdCommand(0x5A, 0x12, pMv, 2);
+        delay(80);
+    }
+
+    // 6. Write RAM remaining capacity (0xE0) to immediately update gauge
+    if (nominalAh > 0.5f) {
+        uint16_t remVal = (uint16_t)(nominalAh * 100.0f);
+        uint8_t pRem[2] = { (uint8_t)(remVal >> 8), (uint8_t)(remVal & 0xFF) };
+        sendJbdCommand(0x5A, 0xE0, pRem, 2);
+        delay(80);
+    }
+
+    // 7. Exit Factory Mode & Save to EEPROM (0x01 -> 0x2828)
+    uint8_t exitPayload[2] = { 0x28, 0x28 };
+    sendJbdCommand(0x5A, 0x01, exitPayload, 2);
+    delay(100);
+
+    // Update local telemetry
+    if (nominalAh > 0.5f) {
+        m_telemetry.capacity_nominal_setting = nominalAh;
+        m_telemetry.capacity_total = nominalAh;
+    }
+    if (cycleAh > 0.5f) {
+        m_telemetry.capacity_cycle_setting = cycleAh;
+        m_telemetry.cycle_capacity = cycleAh;
+    }
+    if (cellCount >= 3 && cellCount <= 32) {
+        m_telemetry.cell_count = cellCount;
+    }
+    if (fullMv >= 2000 && fullMv <= 4500) {
+        m_telemetry.cell_full_voltage_setting = fullMv;
+    }
+
+    // Re-query telemetry
+    sendJbdCommand(0xA5, 0x03);
+    return true;
+}
+
+// ======================== Daly Implementation ========================
+
+uint8_t BmsBleClient::calcDalyChecksum(const uint8_t* buf, size_t len) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < len; ++i) {
+        sum += buf[i];
+    }
+    return sum;
+}
+
+void BmsBleClient::sendDalyCommand(uint8_t cmdId, const uint8_t* payload) {
+    if (!m_isConnected) return;
+    NimBLERemoteCharacteristic* writeChar = m_pDalyWriteChar ? m_pDalyWriteChar : m_pDalyNotifyChar;
+    if (!writeChar) return;
+
+    uint8_t frame[13];
+    frame[0] = 0xA5;
+    frame[1] = 0x40; // Host address
+    frame[2] = cmdId;
+    frame[3] = 0x08; // Length
+    if (payload) {
+        memcpy(&frame[4], payload, 8);
+    } else {
+        memset(&frame[4], 0, 8);
+    }
+    frame[12] = calcDalyChecksum(frame, 12);
+
+    DebugLogger::logTx(TAG, frame, 13, "Daly Cmd 0x" + String(cmdId, HEX));
+    writeChar->writeValue(frame, 13, m_dalyWriteWithResponse);
+}
+
+void BmsBleClient::handleDalyPacket(const uint8_t* data, size_t len) {
+    DebugLogger::logRx(TAG, data, len, "Daly Raw");
+    if (!data || len == 0) return;
+
+    m_rxBuffer.insert(m_rxBuffer.end(), data, data + len);
+
+    size_t i = 0;
+    while (i < m_rxBuffer.size()) {
+        if (m_rxBuffer[i] != 0xA5) {
+            i++;
+            continue;
+        }
+
+        if (m_rxBuffer.size() - i < 13) {
+            break;
+        }
+
+        uint8_t dataLen = m_rxBuffer[i + 3];
+        if (dataLen != 0x08) {
+            i++;
+            continue;
+        }
+
+        uint8_t expectedCrc = m_rxBuffer[i + 12];
+        uint8_t calcCrc = calcDalyChecksum(&m_rxBuffer[i], 12);
+
+        if (calcCrc == expectedCrc) {
+            uint8_t cmdId = m_rxBuffer[i + 2];
+            decodeDalyTelemetry(cmdId, &m_rxBuffer[i + 4]);
+            i += 13;
+        } else {
+            i++;
+        }
+    }
+
+    if (i > 0) {
+        m_rxBuffer.erase(m_rxBuffer.begin(), m_rxBuffer.begin() + i);
+    }
+    if (m_rxBuffer.size() > 256) {
+        m_rxBuffer.clear();
+    }
+}
+
+void BmsBleClient::decodeDalyTelemetry(uint8_t cmdId, const uint8_t* data) {
+    m_telemetry.connected = true;
+    m_telemetry.bms_type = "Daly-BMS";
+    m_telemetry.last_update = millis();
+
+    switch (cmdId) {
+        case 0x90: { // Total Voltage, Current, SoC
+            uint16_t vRaw = (uint16_t(data[0]) << 8) | data[1];
+            m_telemetry.total_voltage = (float)vRaw * 0.1f;
+
+            int32_t iRaw = (int32_t(data[4]) << 8) | data[5];
+            m_telemetry.current = (float)(iRaw - 30000) * 0.1f;
+            m_telemetry.power = m_telemetry.total_voltage * m_telemetry.current;
+            if (m_telemetry.current >= 0.0f) {
+                m_telemetry.charge_power = m_telemetry.power;
+                m_telemetry.discharge_power = 0.0f;
+            } else {
+                m_telemetry.discharge_power = -m_telemetry.power;
+                m_telemetry.charge_power = 0.0f;
+            }
+
+            uint16_t socRaw = (uint16_t(data[6]) << 8) | data[7];
+            m_telemetry.soc = (float)socRaw * 0.1f;
+            break;
+        }
+
+        case 0x91: { // Min/Max Cell V
+            uint16_t maxMv = (uint16_t(data[0]) << 8) | data[1];
+            m_telemetry.max_cell_idx = data[2];
+            uint16_t minMv = (uint16_t(data[3]) << 8) | data[4];
+            m_telemetry.min_cell_idx = data[5];
+
+            m_telemetry.max_cell_v = (float)maxMv * 0.001f;
+            m_telemetry.min_cell_v = (float)minMv * 0.001f;
+            m_telemetry.delta_cell_v = m_telemetry.max_cell_v - m_telemetry.min_cell_v;
+            break;
+        }
+
+        case 0x92: { // Temperature Extremes
+            int8_t maxT = (int8_t)data[0] - 40;
+            int8_t minT = (int8_t)data[2] - 40;
+            m_telemetry.temp_sensor1 = (float)maxT;
+            m_telemetry.temp_sensor2 = (float)minT;
+            break;
+        }
+
+        case 0x93: { // MOS Status & Residual Capacity
+            m_telemetry.switch_charging = (data[1] == 1);
+            m_telemetry.switch_discharging = (data[2] == 1);
+            uint32_t remMah = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) | ((uint32_t)data[6] << 8) | data[7];
+            m_telemetry.capacity_remain = (float)remMah * 0.001f;
+            break;
+        }
+
+        case 0x94: { // Cells & Sensor Count, Cycle Count
+            uint8_t cells = data[0];
+            if (cells >= 1 && cells <= 32) {
+                m_telemetry.cell_count = cells;
+            }
+            m_telemetry.cycle_count = (uint16_t(data[5]) << 8) | data[6];
+            break;
+        }
+
+        case 0x95: { // Cell Voltages (3 cells per frame)
+            uint8_t frameNum = data[0];
+            if (frameNum >= 1 && frameNum <= 11) {
+                uint8_t baseIdx = (frameNum - 1) * 3;
+                uint16_t v1 = (uint16_t(data[1]) << 8) | data[2];
+                uint16_t v2 = (uint16_t(data[3]) << 8) | data[4];
+                uint16_t v3 = (uint16_t(data[5]) << 8) | data[6];
+
+                if (baseIdx < 32 && (baseIdx < m_telemetry.cell_count || m_telemetry.cell_count == 0)) {
+                    if (v1 > 0) m_telemetry.cell_voltages[baseIdx] = (float)v1 * 0.001f;
+                }
+                if (baseIdx + 1 < 32 && (baseIdx + 1 < m_telemetry.cell_count || m_telemetry.cell_count == 0)) {
+                    if (v2 > 0) m_telemetry.cell_voltages[baseIdx + 1] = (float)v2 * 0.001f;
+                }
+                if (baseIdx + 2 < 32 && (baseIdx + 2 < m_telemetry.cell_count || m_telemetry.cell_count == 0)) {
+                    if (v3 > 0) m_telemetry.cell_voltages[baseIdx + 2] = (float)v3 * 0.001f;
+                }
+
+                // Recalculate min/max/delta
+                float minV = 999.0f;
+                float maxV = 0.0f;
+                uint8_t minIdx = 1;
+                uint8_t maxIdx = 1;
+                for (uint8_t c = 0; c < m_telemetry.cell_count && c < 32; ++c) {
+                    float cv = m_telemetry.cell_voltages[c];
+                    if (cv > 0.5f) {
+                        if (cv < minV) { minV = cv; minIdx = c + 1; }
+                        if (cv > maxV) { maxV = cv; maxIdx = c + 1; }
+                    }
+                }
+                if (maxV > 0.0f) {
+                    m_telemetry.max_cell_v = maxV;
+                    m_telemetry.max_cell_idx = maxIdx;
+                    m_telemetry.min_cell_v = (minV < 900.0f) ? minV : 0.0f;
+                    m_telemetry.min_cell_idx = minIdx;
+                    m_telemetry.delta_cell_v = m_telemetry.max_cell_v - m_telemetry.min_cell_v;
+                }
+            }
+            break;
+        }
+
+        case 0x96: { // Temperature Sensors
+            uint8_t frameNum = data[0];
+            if (frameNum == 1) {
+                if (data[1] != 0) m_telemetry.temp_sensor1 = (int8_t)data[1] - 40;
+                if (data[2] != 0) m_telemetry.temp_sensor2 = (int8_t)data[2] - 40;
+                if (data[3] != 0) m_telemetry.temp_mos = (int8_t)data[3] - 40;
+            }
+            break;
+        }
+
+        case 0x97: { // Balancing status
+            uint32_t balMask = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+            m_telemetry.balancing_active = (balMask != 0);
+            m_telemetry.switch_balancer = (balMask != 0);
+            m_telemetry.balancer_direction = m_telemetry.balancing_active ? "Активне" : "Очікування";
+            break;
+        }
+
+        case 0x98: { // Fault / Failure Status (8 bytes)
+            m_telemetry.raw_errors = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+            bool hasError = false;
+            String errStr = "";
+
+            if (data[0] & 0x01) { errStr += "Cell OV L1; "; hasError = true; }
+            if (data[0] & 0x02) { errStr += "Cell OV L2; "; hasError = true; }
+            if (data[0] & 0x04) { errStr += "Cell UV L1; "; hasError = true; }
+            if (data[0] & 0x08) { errStr += "Cell UV L2; "; hasError = true; }
+            if (data[0] & 0x10) { errStr += "Pack OV L1; "; hasError = true; }
+            if (data[0] & 0x20) { errStr += "Pack OV L2; "; hasError = true; }
+            if (data[0] & 0x40) { errStr += "Pack UV L1; "; hasError = true; }
+            if (data[0] & 0x80) { errStr += "Pack UV L2; "; hasError = true; }
+
+            if (data[1] & 0x01) { errStr += "Chg OT L1; "; hasError = true; }
+            if (data[1] & 0x02) { errStr += "Chg OT L2; "; hasError = true; }
+            if (data[1] & 0x04) { errStr += "Chg UT L1; "; hasError = true; }
+            if (data[1] & 0x08) { errStr += "Chg UT L2; "; hasError = true; }
+            if (data[1] & 0x10) { errStr += "Dsg OT L1; "; hasError = true; }
+            if (data[1] & 0x20) { errStr += "Dsg OT L2; "; hasError = true; }
+            if (data[1] & 0x40) { errStr += "Dsg UT L1; "; hasError = true; }
+            if (data[1] & 0x80) { errStr += "Dsg UT L2; "; hasError = true; }
+
+            if (data[2] & 0x01) { errStr += "Chg OC L1; "; hasError = true; }
+            if (data[2] & 0x02) { errStr += "Chg OC L2; "; hasError = true; }
+            if (data[2] & 0x04) { errStr += "Dsg OC L1; "; hasError = true; }
+            if (data[2] & 0x08) { errStr += "Dsg OC L2; "; hasError = true; }
+            if (data[2] & 0x10) { errStr += "High SOC; "; hasError = true; }
+            if (data[2] & 0x20) { errStr += "Low SOC; "; hasError = true; }
+            if (data[2] & 0x40) { errStr += "Cell Diff L1; "; hasError = true; }
+            if (data[2] & 0x80) { errStr += "Cell Diff L2; "; hasError = true; }
+
+            if (data[3] & 0x01) { errStr += "MOS Over-temp; "; hasError = true; }
+            if (data[3] & 0x02) { errStr += "Temp Sensor Fault; "; hasError = true; }
+            if (data[3] & 0x04) { errStr += "Cell Sampling Fault; "; hasError = true; }
+            if (data[3] & 0x08) { errStr += "MOS Fault; "; hasError = true; }
+            if (data[3] & 0x10) { errStr += "Short Circuit; "; hasError = true; }
+
+            if (hasError) {
+                m_telemetry.errors_str = errStr;
+            } else {
+                m_telemetry.errors_str = "OK (Без помилок)";
+            }
+            break;
+        }
+
+        case 0x21:
+        case 0x51: { // Rated Capacity
+            uint32_t nomMah = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+            if (nomMah > 0) {
+                m_telemetry.capacity_nominal_setting = (float)nomMah * 0.001f;
+                m_telemetry.capacity_total = m_telemetry.capacity_nominal_setting;
+                m_telemetry.capacity_cycle_setting = m_telemetry.capacity_nominal_setting * 0.8f;
+                m_telemetry.cycle_capacity = m_telemetry.capacity_cycle_setting;
+                DebugLogger::info(TAG, "Daly Rated Capacity: " + String(m_telemetry.capacity_nominal_setting, 1) + " Ah");
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+bool BmsBleClient::writeDalyCapacityParams(float nominalAh, uint8_t cellCount) {
+    if (!m_isConnected || m_telemetry.bms_type != "Daly-BMS") {
+        DebugLogger::warn(TAG, "writeDalyCapacityParams failed: not connected to Daly BMS");
+        return false;
+    }
+
+    char logBuf[128];
+    sprintf(logBuf, "Writing Daly Params: Nom=%.1fAh, Cells=%dS", nominalAh, cellCount);
+    DebugLogger::info(TAG, logBuf);
+
+    if (nominalAh > 0.5f) {
+        uint32_t mah = (uint32_t)(nominalAh * 1000.0f);
+        uint8_t pNom[8] = { (uint8_t)(mah >> 24), (uint8_t)(mah >> 16), (uint8_t)(mah >> 8), (uint8_t)(mah & 0xFF), 0, 0, 0, 0 };
+        sendDalyCommand(0x21, pNom);
+        delay(80);
+        sendDalyCommand(0x51, pNom);
+        delay(80);
+        m_telemetry.capacity_nominal_setting = nominalAh;
+        m_telemetry.capacity_total = nominalAh;
+        m_telemetry.capacity_cycle_setting = nominalAh * 0.8f;
+        m_telemetry.cycle_capacity = m_telemetry.capacity_cycle_setting;
+    }
+
+    if (cellCount >= 3 && cellCount <= 32) {
+        uint8_t pCnt[8] = { cellCount, 0, 0, 0, 0, 0, 0, 0 };
+        sendDalyCommand(0x50, pCnt);
+        delay(80);
+        sendDalyCommand(0xD6, pCnt);
+        delay(80);
+        m_telemetry.cell_count = cellCount;
+    }
+
+    sendDalyCommand(0x90);
+    delay(50);
+    sendDalyCommand(0x94);
+    return true;
+}
