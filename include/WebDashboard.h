@@ -653,10 +653,11 @@ input, select { width: 100%; padding: 10px; border-radius: 8px; border: 1px soli
   <div class="field">
     <label data-i18n="lbl_bms_type">Тип BMS</label>
     <select id="bms-type">
-      <option value="0">Auto Detect (JBD / JK / Daly)</option>
+      <option value="0">Auto Detect (JBD / JK / Daly / Ant)</option>
       <option value="2">JBD-BMS (Xiaoxiang / Smart BMS)</option>
       <option value="1">JK-BMS (Hankzor / JiKong)</option>
       <option value="3">Daly-BMS (Daly Smart BMS)</option>
+      <option value="4">Ant-BMS (Smart Ant BMS)</option>
     </select>
   </div>
 
@@ -917,6 +918,7 @@ function applyBleChoice(valStr) {
     if (d.type === 'JBD-BMS') document.getElementById('bms-type').value = 2;
     if (d.type === 'JK-BMS') document.getElementById('bms-type').value = 1;
     if (d.type === 'Daly-BMS') document.getElementById('bms-type').value = 3;
+    if (d.type === 'Ant-BMS') document.getElementById('bms-type').value = 4;
   } catch(e) {}
 }
 

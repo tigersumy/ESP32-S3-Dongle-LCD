@@ -9,6 +9,7 @@
 #define BMS_TYPE_JK   1
 #define BMS_TYPE_JBD  2
 #define BMS_TYPE_DALY 3
+#define BMS_TYPE_ANT  4
 
 struct AppConfig {
     String  wifi_ssid;

@@ -81,6 +81,9 @@ class BmsScanCallbacks : public NimBLEScanCallbacks {
             } else {
                 type = "JBD-BMS";
             }
+        } else if (name.startsWith("ANT") || name.startsWith("ant") || name.indexOf("ANT-") >= 0 || name.indexOf("ant-") >= 0 ||
+                   name.startsWith("MAYA") || name.indexOf("AntBMS") >= 0 || name.indexOf("ANT_") >= 0) {
+            type = "Ant-BMS";
         }
 
         for (auto& dev : s_pInstance->m_discoveredDevices) {
@@ -248,6 +251,10 @@ void BmsBleClient::loop() {
             } else if (m_telemetry.bms_type == "JK-BMS") {
                 if (m_telemetry.last_update == 0 || (now - m_telemetry.last_update > 4000)) {
                     sendJkPollRequest();
+                }
+            } else if (m_telemetry.bms_type == "Ant-BMS") {
+                if (m_telemetry.last_update == 0 || (now - m_lastPollTime >= 1000)) {
+                    sendAntPollRequest();
                 }
             }
         }
@@ -506,7 +513,56 @@ bool BmsBleClient::connectToDevice(const NimBLEAddress& address, const String& n
         }
     }
 
-    DebugLogger::error(TAG, "No usable JBD (FF00/FFF0/FEE7), JK (FFE0), or Daly (FFE0) characteristics discovered");
+    // 4. Process Ant BMS
+    bool isAntCandidate = (forcedType == BMS_TYPE_ANT) ||
+                          (name.startsWith("ANT") || name.startsWith("ant") || name.indexOf("ANT-") >= 0 || name.indexOf("ant-") >= 0 ||
+                           name.startsWith("MAYA") || name.indexOf("AntBMS") >= 0 || name.indexOf("ANT_") >= 0);
+
+    if (isAntCandidate || forcedType == BMS_TYPE_ANT || (forcedType == BMS_TYPE_AUTO && !pJkService)) {
+        m_pAntNotifyChar = nullptr;
+        m_pAntWriteChar  = nullptr;
+
+        for (auto* s : services) {
+            for (auto* c : s->getCharacteristics(true)) {
+                String uuid = c->getUUID().toString().c_str();
+                uuid.toLowerCase();
+                if (uuid.indexOf("ffe1") >= 0 || uuid.indexOf("fee1") >= 0 || uuid.indexOf("fff1") >= 0) {
+                    if (c->canNotify() || c->canIndicate()) m_pAntNotifyChar = c;
+                }
+                if (uuid.indexOf("ffe1") >= 0 || uuid.indexOf("ffe2") >= 0 || uuid.indexOf("fee2") >= 0 || uuid.indexOf("fff2") >= 0) {
+                    if (c->canWrite() || c->canWriteNoResponse()) m_pAntWriteChar = c;
+                }
+            }
+        }
+
+        if (!m_pAntNotifyChar && !notifyChars.empty()) m_pAntNotifyChar = notifyChars[0];
+        if (!m_pAntWriteChar && !writeChars.empty()) m_pAntWriteChar = writeChars[0];
+        if (!m_pAntWriteChar && m_pAntNotifyChar && (m_pAntNotifyChar->canWrite() || m_pAntNotifyChar->canWriteNoResponse())) {
+            m_pAntWriteChar = m_pAntNotifyChar;
+        }
+
+        if (m_pAntNotifyChar && (isAntCandidate || forcedType == BMS_TYPE_ANT)) {
+            DebugLogger::info(TAG, "Attempting Ant BMS protocol negotiation...");
+            m_pAntNotifyChar->subscribe(true, [this](NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+                this->handleAntPacket(pData, length);
+            });
+            m_antWriteWithResponse = m_pAntWriteChar ? (m_pAntWriteChar->canWrite() && !m_pAntWriteChar->canWriteNoResponse()) : false;
+            DebugLogger::info(TAG, "Selected Ant BMS: Notify H:" + String(m_pAntNotifyChar->getHandle()) + 
+                                  ", Write H:" + String(m_pAntWriteChar ? m_pAntWriteChar->getHandle() : 0));
+
+            m_isConnected = true;
+            m_telemetry.connected = true;
+            m_telemetry.bms_type = "Ant-BMS";
+            m_telemetry.device_name = name.length() > 0 ? name : "Ant-BMS";
+            m_telemetry.mac_address = address.toString().c_str();
+            m_telemetry.last_update = millis();
+
+            sendAntPollRequest();
+            return true;
+        }
+    }
+
+    DebugLogger::error(TAG, "No usable JBD, JK, Daly, or Ant characteristics discovered");
     disconnect();
     return false;
 }
@@ -523,6 +579,9 @@ void BmsBleClient::disconnect() {
     m_pJkWriteChar   = nullptr;
     m_pDalyNotifyChar = nullptr;
     m_pDalyWriteChar  = nullptr;
+    m_pAntNotifyChar  = nullptr;
+    m_pAntWriteChar   = nullptr;
+    m_antRxBuffer.clear();
     m_rxBuffer.clear();
 }
 
@@ -1036,6 +1095,25 @@ bool BmsBleClient::setSwitch(const String& sw, bool state) {
             m_telemetry.switch_discharging = state;
             return true;
         }
+    } else if (m_telemetry.bms_type == "Ant-BMS") {
+        if (!m_pAntWriteChar) return false;
+        uint8_t cmd[6] = { 0xA5, 0xA5, 0x00, (uint8_t)(state ? 0x01 : 0x00), 0x00, 0xAA };
+        if (sw == "charging") {
+            cmd[2] = 0x01;
+            m_telemetry.switch_charging = state;
+        } else if (sw == "discharging") {
+            cmd[2] = 0x02;
+            m_telemetry.switch_discharging = state;
+        } else if (sw == "balancer") {
+            cmd[2] = 0x03;
+            m_telemetry.switch_balancer = state;
+        } else {
+            return false;
+        }
+        cmd[4] = cmd[0] ^ cmd[1] ^ cmd[2] ^ cmd[3];
+        DebugLogger::logTx(TAG, cmd, sizeof(cmd), "Ant Switch " + sw);
+        m_pAntWriteChar->writeValue(cmd, sizeof(cmd), m_antWriteWithResponse);
+        return true;
     }
     return false;
 }
@@ -1443,4 +1521,162 @@ bool BmsBleClient::writeDalyCapacityParams(float nominalAh, uint8_t cellCount) {
     delay(50);
     sendDalyCommand(0x94);
     return true;
+}
+
+void BmsBleClient::sendAntPollRequest() {
+    if (!m_isConnected || !m_pAntWriteChar) return;
+    static const uint8_t antQueryBle[]  = { 0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00 };
+    static const uint8_t antQueryUart[] = { 0x5A, 0x5A, 0x00, 0x00, 0x00, 0x00 };
+
+    DebugLogger::logTx(TAG, antQueryBle, sizeof(antQueryBle), "Ant-BMS Query (0xDB)");
+    m_pAntWriteChar->writeValue(antQueryBle, sizeof(antQueryBle), m_antWriteWithResponse);
+
+    if (m_pollStep % 4 == 2) {
+        m_pAntWriteChar->writeValue(antQueryUart, sizeof(antQueryUart), m_antWriteWithResponse);
+    }
+    m_pollStep++;
+}
+
+void BmsBleClient::handleAntPacket(const uint8_t* data, size_t len) {
+    if (!data || len == 0) return;
+
+    for (size_t i = 0; i < len; ++i) {
+        m_antRxBuffer.push_back(data[i]);
+    }
+
+    if (m_antRxBuffer.size() > 512) {
+        m_antRxBuffer.erase(m_antRxBuffer.begin(), m_antRxBuffer.begin() + 256);
+    }
+
+    while (m_antRxBuffer.size() >= 140) {
+        bool foundHeader = false;
+        size_t headerIdx = 0;
+        for (size_t i = 0; i <= m_antRxBuffer.size() - 4; ++i) {
+            if (m_antRxBuffer[i] == 0xAA && m_antRxBuffer[i+1] == 0x55 && 
+                m_antRxBuffer[i+2] == 0xAA && m_antRxBuffer[i+3] == 0xFF) {
+                foundHeader = true;
+                headerIdx = i;
+                break;
+            }
+        }
+
+        if (!foundHeader) {
+            for (size_t i = 0; i <= m_antRxBuffer.size() - 2; ++i) {
+                if (m_antRxBuffer[i] == 0x7E && m_antRxBuffer[i+1] == 0xA1) {
+                    foundHeader = true;
+                    headerIdx = i;
+                    break;
+                }
+            }
+        }
+
+        if (!foundHeader) {
+            if (m_antRxBuffer.size() > 3) {
+                m_antRxBuffer.erase(m_antRxBuffer.begin(), m_antRxBuffer.end() - 3);
+            }
+            break;
+        }
+
+        if (headerIdx > 0) {
+            m_antRxBuffer.erase(m_antRxBuffer.begin(), m_antRxBuffer.begin() + headerIdx);
+        }
+
+        if (m_antRxBuffer.size() < 140) break;
+
+        std::vector<uint8_t> frame(m_antRxBuffer.begin(), m_antRxBuffer.begin() + 140);
+        m_antRxBuffer.erase(m_antRxBuffer.begin(), m_antRxBuffer.begin() + 140);
+
+        decodeAntTelemetry(frame);
+    }
+}
+
+void BmsBleClient::decodeAntTelemetry(const std::vector<uint8_t>& d) {
+    if (d.size() < 140) return;
+
+    m_telemetry.connected = true;
+    m_telemetry.bms_type = "Ant-BMS";
+    m_telemetry.last_update = millis();
+
+    float minV = 999.0f;
+    float maxV = 0.0f;
+    uint8_t minIdx = 1;
+    uint8_t maxIdx = 1;
+    uint8_t activeCells = 0;
+    float sumV = 0.0f;
+
+    for (int i = 0; i < 32; ++i) {
+        size_t offset = 4 + (i * 2);
+        if (offset + 1 >= d.size()) break;
+        uint16_t rawMv = (uint16_t(d[offset]) << 8) | d[offset + 1];
+        if (rawMv >= 1000 && rawMv <= 5000) {
+            float v = rawMv * 0.001f;
+            m_telemetry.cell_voltages[i] = v;
+            sumV += v;
+            activeCells++;
+            if (v < minV) { minV = v; minIdx = i + 1; }
+            if (v > maxV) { maxV = v; maxIdx = i + 1; }
+        } else {
+            m_telemetry.cell_voltages[i] = 0.0f;
+        }
+    }
+
+    if (activeCells > 0) {
+        m_telemetry.cell_count = activeCells;
+        m_telemetry.min_cell_idx = minIdx;
+        m_telemetry.max_cell_idx = maxIdx;
+        m_telemetry.min_cell_v = minV;
+        m_telemetry.max_cell_v = maxV;
+        m_telemetry.delta_cell_v = maxV - minV;
+        m_telemetry.total_voltage = sumV;
+    }
+
+    int32_t rawCur = (int32_t)((uint32_t(d[70]) << 24) | (uint32_t(d[71]) << 16) | (uint32_t(d[72]) << 8) | uint32_t(d[73]));
+    m_telemetry.current = rawCur * 0.1f;
+    m_telemetry.power = m_telemetry.total_voltage * m_telemetry.current;
+    if (m_telemetry.current > 0.05f) {
+        m_telemetry.charge_power = m_telemetry.power;
+        m_telemetry.discharge_power = 0.0f;
+    } else if (m_telemetry.current < -0.05f) {
+        m_telemetry.charge_power = 0.0f;
+        m_telemetry.discharge_power = fabsf(m_telemetry.power);
+    } else {
+        m_telemetry.charge_power = 0.0f;
+        m_telemetry.discharge_power = 0.0f;
+    }
+
+    m_telemetry.soc = d[74];
+
+    uint32_t rawTotalCap = (uint32_t(d[75]) << 24) | (uint32_t(d[76]) << 16) | (uint32_t(d[77]) << 8) | d[78];
+    uint32_t rawRemainCap = (uint32_t(d[79]) << 24) | (uint32_t(d[80]) << 16) | (uint32_t(d[81]) << 8) | d[82];
+    if (rawTotalCap > 1000000) {
+        m_telemetry.capacity_total = rawTotalCap * 0.000001f;
+        m_telemetry.capacity_remain = rawRemainCap * 0.000001f;
+    } else if (rawTotalCap > 1000) {
+        m_telemetry.capacity_total = rawTotalCap * 0.001f;
+        m_telemetry.capacity_remain = rawRemainCap * 0.001f;
+    } else {
+        m_telemetry.capacity_total = rawTotalCap;
+        m_telemetry.capacity_remain = rawRemainCap;
+    }
+
+    int16_t tMos = (int16_t)((d[91] << 8) | d[92]);
+    int16_t t1   = (int16_t)((d[93] << 8) | d[94]);
+    int16_t t2   = (int16_t)((d[95] << 8) | d[96]);
+    m_telemetry.temp_mos     = tMos;
+    m_telemetry.temp_sensor1 = t1;
+    m_telemetry.temp_sensor2 = t2;
+
+    m_telemetry.switch_charging = (d[103] == 1);
+    m_telemetry.switch_discharging = (d[104] == 1);
+    m_telemetry.switch_balancer = (d[105] > 0);
+    m_telemetry.balancing_active = m_telemetry.switch_balancer;
+
+    m_telemetry.errors_str = "OK (Без помилок)";
+
+    char logBuf[160];
+    sprintf(logBuf, "Ant Telemetry (%dS): V=%.2fV, I=%.2fA, SOC=%.0f%%, Delta=%.3fV (Min=C%d:%.3fV, Max=C%d:%.3fV)",
+            m_telemetry.cell_count, m_telemetry.total_voltage, m_telemetry.current, m_telemetry.soc,
+            m_telemetry.delta_cell_v, m_telemetry.min_cell_idx, m_telemetry.min_cell_v,
+            m_telemetry.max_cell_idx, m_telemetry.max_cell_v);
+    DebugLogger::info(TAG, logBuf);
 }

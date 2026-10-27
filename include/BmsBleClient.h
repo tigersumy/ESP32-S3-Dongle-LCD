@@ -59,6 +59,10 @@ private:
     void decodeDalyTelemetry(uint8_t cmdId, const uint8_t* payload);
     uint8_t calcDalyChecksum(const uint8_t* buf, size_t len);
 
+    void sendAntPollRequest();
+    void handleAntPacket(const uint8_t* data, size_t len);
+    void decodeAntTelemetry(const std::vector<uint8_t>& data);
+
     AppConfig        m_config;
     NimBLEClient*    m_pClient = nullptr;
     bool             m_isConnected = false;
@@ -81,6 +85,12 @@ private:
     NimBLERemoteCharacteristic* m_pDalyNotifyChar = nullptr;
     NimBLERemoteCharacteristic* m_pDalyWriteChar  = nullptr;
     bool                        m_dalyWriteWithResponse = false;
+
+    // Ant Characteristics
+    NimBLERemoteCharacteristic* m_pAntNotifyChar  = nullptr;
+    NimBLERemoteCharacteristic* m_pAntWriteChar   = nullptr;
+    bool                        m_antWriteWithResponse = false;
+    std::vector<uint8_t>        m_antRxBuffer;
 
     BmsTelemetry     m_telemetry;
     std::vector<uint8_t> m_rxBuffer;
